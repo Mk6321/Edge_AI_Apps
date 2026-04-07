@@ -1,0 +1,52 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.iml
+
+# Git / temp
+*.log
+*.tmp
+*.temp
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# Flutter / Dart
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+.pub/
+build/
+
+# Android / Gradle
+.gradle/
+local.properties
+captures/
+*.apk
+*.aab
+
+# iOS / macOS generated
+Pods/
+.symlinks/
+Flutter/ephemeral/
+Flutter/Generated.xcconfig
+Flutter/flutter_export_environment.sh
+
+# Generated plugin registrants
+**/GeneratedPluginRegistrant.*
+
+# Local model/data artifacts that are not source code
+Glass_app/backend/dataset/
+Glass_app/backend/face_encodings.pkl
+Glass_app/backend/faces_database.json
+Glass_app/*.pt

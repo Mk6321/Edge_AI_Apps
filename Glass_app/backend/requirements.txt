@@ -1,0 +1,9 @@
+flask
+pyngrok
+ultralytics
+opencv-python
+numpy
+pillow
+requests
+openai
+face_recognition

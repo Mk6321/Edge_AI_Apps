@@ -1,0 +1,46 @@
+name: merged_app
+description: Edge AI Smart Glass — fully on-device vision assistant.
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.11.1
+
+dependencies:
+  flutter:
+    sdk: flutter
+  # ── LFM2-VL on-device inference ──
+  llamadart: ^0.6.8
+  path_provider: ^2.1.5
+  http: ^1.6.0
+  # ── Google ML Kit ──
+  google_mlkit_text_recognition: ^0.15.1
+  google_mlkit_face_detection: ^0.13.2
+  # ── Face embedding (MobileFaceNet TFLite) ──
+  tflite_flutter: ^0.11.0
+  image: ^4.5.3
+  # ── Voice I/O ──
+  speech_to_text: ^7.0.0
+  flutter_tts: ^4.2.0
+  # ── Permissions ──
+  permission_handler: ^11.3.1
+  cupertino_icons: ^1.0.8
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+
+hooks:
+  user_defines:
+    llamadart:
+      llamadart_native_backends:
+        platforms:
+          android-arm64:
+            backends: [cpu]
+            cpu_profile: compact
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/models/
