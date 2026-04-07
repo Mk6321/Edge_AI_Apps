@@ -1,26 +1,24 @@
+import 'dart:convert';
+import 'dart:io';
 import 'dart:typed_data';
-import 'package:google_generative_ai/google_generative_ai.dart';
+
 import 'package:http/http.dart' as http;
 
-/// API service for Smart Glass — now calls Gemini DIRECTLY from the app.
+/// API service for Smart Glass.
 ///
-/// ╔═══════════════════════════════════════════════════════════╗
-/// ║  NO BACKEND SERVER. NO NGROK. NO LAPTOP REQUIRED.        ║
-/// ║  Gemini API key is embedded in the app.                  ║
-/// ║  Face recognition is handled by FaceService (separate).  ║
-/// ╚═══════════════════════════════════════════════════════════╝
+/// Scene analysis uses NVIDIA's hosted Phi-3.5 Vision Instruct model.
 class ApiService {
-  // ── CONFIGURATION ──────────────────────────────────────────────────────────
-  /// Your Gemini API key — embedded directly in the app.
-  static const String _geminiApiKey = 'AIzaSyCeePRv_oEeQzyGfgpMKgBhcPfPSaFC1vw';
+  static const String _nvidiaApiKey = String.fromEnvironment(
+    'NVIDIA_API_KEY',
+    defaultValue:
+        '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',
+  );
 
-  /// ESP32-CAM capture URL.
+  static const String _nvidiaEndpoint =
+      'https://integrate.api.nvidia.com/v1/chat/completions';
+  static const String _nvidiaModel = 'microsoft/phi-3.5-vision-instruct';
   static const String _esp32Url = 'http://10.235.89.20/capture';
 
-  // ── Gemini Model ───────────────────────────────────────────────────────────
-  late final GenerativeModel _model;
-
-  // ── System Prompts ─────────────────────────────────────────────────────────
   static const String _visionSystemPrompt =
       'You are a spatial awareness assistant for a visually impaired user. '
       'Describe the objects and environment concisely. '
@@ -34,94 +32,156 @@ class ApiService {
 
   static const String _currencySystemPrompt =
       'You are a financial detection engine. Output ONLY the number and the '
-      'currency type (e.g., "100 Rupees"). Do not write full sentences.';
+      'currency type (for example "100 Rupees"). Do not write full sentences.';
 
-  // ---------------------------------------------------------------------------
-  // INIT
-  // ---------------------------------------------------------------------------
+  Future<void> init() async {}
 
-  Future<void> init() async {
-    _model = GenerativeModel(
-      model: 'gemini-2.5-flash',
-      apiKey: _geminiApiKey,
-    );
-    print('[API] Gemini model initialized (gemini-2.5-flash, direct SDK).');
-  }
-
-  // ---------------------------------------------------------------------------
-  // IMAGE CAPTURE (ESP32-CAM — unchanged)
-  // ---------------------------------------------------------------------------
-
-  /// Captures a JPEG frame from the ESP32-CAM.
   Future<Uint8List?> captureImage() async {
     try {
-      print('[ESP32] GET $_esp32Url');
       final response = await http
           .get(Uri.parse(_esp32Url))
           .timeout(const Duration(seconds: 5));
       if (response.statusCode == 200) {
-        print('[ESP32] Captured ${response.bodyBytes.length} bytes.');
         return response.bodyBytes;
-      } else {
-        print('[ESP32] Error: status ${response.statusCode}');
       }
-    } catch (e) {
-      print('[ESP32] Exception: $e');
-    }
+    } catch (_) {}
     return null;
   }
 
-  // ---------------------------------------------------------------------------
-  // GEMINI VISION — replaces /analyze endpoint
-  // ---------------------------------------------------------------------------
-
-  /// Sends image + query directly to Gemini. No backend needed.
   Future<String> analyzeImage(Uint8List imageBytes, String query) async {
+    final systemPrompt = _pickSystemPrompt(query);
+    final base64Image = base64Encode(imageBytes);
+
     try {
-      print('[GEMINI] Analyzing image — query: "$query"');
+      final response = await http
+          .post(
+            Uri.parse(_nvidiaEndpoint),
+            headers: {
+              'Authorization': 'Bearer $_nvidiaApiKey',
+              'Content-Type': 'application/json',
+              'Accept': 'application/json',
+            },
+            body: jsonEncode({
+              'model': _nvidiaModel,
+              'stream': false,
+              'max_tokens': 250,
+              'temperature': 0.2,
+              'messages': [
+                {
+                  'role': 'user',
+                  'content': [
+                    {
+                      'type': 'text',
+                      'text': '$systemPrompt\n\nUser query: $query',
+                    },
+                    {
+                      'type': 'image_url',
+                      'image_url': {
+                        'url': 'data:image/jpeg;base64,$base64Image',
+                      },
+                    },
+                  ],
+                },
+              ],
+            }),
+          )
+          .timeout(const Duration(seconds: 30));
 
-      // Pick system prompt based on query keywords
-      final systemPrompt = _pickSystemPrompt(query);
+      final body = _decodeJsonBody(response.body);
 
-      final response = await _model.generateContent([
-        Content.multi([
-          TextPart('$systemPrompt\n\nUser query: $query'),
-          DataPart('image/jpeg', imageBytes),
-        ]),
-      ]);
-
-      final text = response.text ?? 'No response generated.';
-      print('[GEMINI] Response: $text');
-      return text;
-    } catch (e) {
-      print('[GEMINI] Error: $e');
-      if (e.toString().contains('quota') || e.toString().contains('429')) {
-        return 'API quota exceeded. Please wait a moment and try again.';
+      if (response.statusCode >= 400) {
+        final detail = body?['detail'];
+        final title = body?['title'];
+        final message =
+            detail?.toString() ??
+            title?.toString() ??
+            _plainErrorText(response.body) ??
+            'Request failed.';
+        if (response.statusCode == 429) {
+          return 'NVIDIA API rate limit reached. Please wait a moment and try again.';
+        }
+        if (response.statusCode == 404) {
+          return 'NVIDIA API endpoint not found. Please verify the configured URL and model.';
+        }
+        return 'NVIDIA API error: $message';
       }
-      return 'Gemini error: $e';
+
+      if (body == null) {
+        return 'NVIDIA API error: invalid response format.';
+      }
+
+      final choices = body['choices'];
+      if (choices is! List || choices.isEmpty) {
+        return 'No response generated.';
+      }
+
+      final message = choices.first['message'];
+      final content = message is Map<String, dynamic> ? message['content'] : null;
+      final text = _extractTextContent(content);
+      return text.isEmpty ? 'No response generated.' : text;
+    } on SocketException {
+      return 'NVIDIA API network error. Please check your internet connection and try again.';
+    } on FormatException {
+      return 'NVIDIA API returned an unexpected response. Please try again.';
+    } catch (error) {
+      return 'NVIDIA API error: $error';
     }
   }
 
-  // ---------------------------------------------------------------------------
-  // SYSTEM PROMPT SELECTION
-  // ---------------------------------------------------------------------------
+  Map<String, dynamic>? _decodeJsonBody(String body) {
+    try {
+      final decoded = jsonDecode(body);
+      if (decoded is Map<String, dynamic>) {
+        return decoded;
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  String? _plainErrorText(String body) {
+    final cleaned = body.trim();
+    if (cleaned.isEmpty) {
+      return null;
+    }
+    return cleaned.length > 180 ? '${cleaned.substring(0, 180)}...' : cleaned;
+  }
+
+  String _extractTextContent(dynamic content) {
+    if (content is String) {
+      return content.trim();
+    }
+
+    if (content is List) {
+      final parts = <String>[];
+      for (final entry in content) {
+        if (entry is Map<String, dynamic>) {
+          final text = entry['text'];
+          if (text is String && text.trim().isNotEmpty) {
+            parts.add(text.trim());
+          }
+        }
+      }
+      return parts.join('\n').trim();
+    }
+
+    return '';
+  }
 
   String _pickSystemPrompt(String query) {
     final q = query.toLowerCase();
 
-    // Currency detection
-    if (RegExp(r'\b(?:rupee|rupees|money|note|notes|coin|coins|currency|cash|denomination)\b')
-        .hasMatch(q)) {
+    if (RegExp(
+      r'\b(?:rupee|rupees|money|note|notes|coin|coins|currency|cash|denomination)\b',
+    ).hasMatch(q)) {
       return _currencySystemPrompt;
     }
 
-    // OCR / text reading
-    if (RegExp(r'\b(?:read|text|passage|document|words?|letters?|sign|says|written)\b')
-        .hasMatch(q)) {
+    if (RegExp(
+      r'\b(?:read|text|passage|document|words?|letters?|sign|says|written)\b',
+    ).hasMatch(q)) {
       return _ocrSystemPrompt;
     }
 
-    // Default: scene description
     return _visionSystemPrompt;
   }
 }

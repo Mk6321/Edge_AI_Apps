@@ -7,6 +7,20 @@ import 'package:image/image.dart' as img;
 import 'package:path_provider/path_provider.dart';
 import 'package:tflite_flutter/tflite_flutter.dart';
 
+class FaceVaultEntry {
+  const FaceVaultEntry({
+    required this.name,
+    required this.description,
+    required this.imagePaths,
+    required this.registeredAt,
+  });
+
+  final String name;
+  final String description;
+  final List<String> imagePaths;
+  final DateTime? registeredAt;
+}
+
 /// On-device face recognition engine.
 ///
 /// **Stage 1 (Finder):** Google ML Kit Face Detection — detects faces, crops.
@@ -39,6 +53,44 @@ class FaceService {
   bool _initialized = false;
   bool get isReady => _initialized;
 
+  List<FaceVaultEntry> getRegisteredFaces() {
+    final entries = <FaceVaultEntry>[];
+
+    for (final entry in _vault.entries) {
+      final raw = entry.value;
+      if (raw is! Map<String, dynamic>) {
+        continue;
+      }
+
+      final images =
+          (raw['images'] as List?)
+              ?.map((value) => value.toString())
+              .where((value) => value.isNotEmpty)
+              .toList() ??
+          <String>[];
+
+      final registeredAtRaw = raw['registered_at']?.toString();
+      entries.add(
+        FaceVaultEntry(
+          name: entry.key,
+          description: raw['description']?.toString() ?? '',
+          imagePaths: images,
+          registeredAt: registeredAtRaw == null
+              ? null
+              : DateTime.tryParse(registeredAtRaw),
+        ),
+      );
+    }
+
+    entries.sort((a, b) {
+      final aTime = a.registeredAt?.millisecondsSinceEpoch ?? 0;
+      final bTime = b.registeredAt?.millisecondsSinceEpoch ?? 0;
+      return bTime.compareTo(aTime);
+    });
+
+    return entries;
+  }
+
   // ---------------------------------------------------------------------------
   // INIT / DISPOSE
   // ---------------------------------------------------------------------------
@@ -50,7 +102,9 @@ class FaceService {
     print('[FACE] Initializing FaceService...');
 
     // Load TFLite interpreter from bundled asset
-    _interpreter = await Interpreter.fromAsset('assets/models/mobilefacenet.tflite');
+    _interpreter = await Interpreter.fromAsset(
+      'assets/models/mobilefacenet.tflite',
+    );
     print('[FACE] MobileFaceNet TFLite loaded.');
 
     // Load vault from disk
@@ -85,9 +139,13 @@ class FaceService {
     print('[FACE-S1] Found ${faces.length} face(s). Using the largest.');
 
     // Pick the largest face
-    final face = faces.reduce((a, b) =>
-        (a.boundingBox.width * a.boundingBox.height) >=
-            (b.boundingBox.width * b.boundingBox.height) ? a : b);
+    final face = faces.reduce(
+      (a, b) =>
+          (a.boundingBox.width * a.boundingBox.height) >=
+              (b.boundingBox.width * b.boundingBox.height)
+          ? a
+          : b,
+    );
 
     // Read the full image and crop to the bounding box
     final bytes = await File(imagePath).readAsBytes();
@@ -132,24 +190,25 @@ class FaceService {
     final bytes = File(croppedFacePath).readAsBytesSync();
     final decoded = img.decodeImage(bytes);
     if (decoded == null) throw StateError('Cannot decode cropped face.');
-    final resized = img.copyResize(decoded, width: _inputSize, height: _inputSize);
+    final resized = img.copyResize(
+      decoded,
+      width: _inputSize,
+      height: _inputSize,
+    );
 
     // Normalize pixels to [-1, 1] and create input tensor [1, 112, 112, 3]
     final input = List.generate(
       1,
       (_) => List.generate(
         _inputSize,
-        (y) => List.generate(
-          _inputSize,
-          (x) {
-            final pixel = resized.getPixel(x, y);
-            return [
-              (pixel.r.toDouble() - 127.5) / 127.5,
-              (pixel.g.toDouble() - 127.5) / 127.5,
-              (pixel.b.toDouble() - 127.5) / 127.5,
-            ];
-          },
-        ),
+        (y) => List.generate(_inputSize, (x) {
+          final pixel = resized.getPixel(x, y);
+          return [
+            (pixel.r.toDouble() - 127.5) / 127.5,
+            (pixel.g.toDouble() - 127.5) / 127.5,
+            (pixel.b.toDouble() - 127.5) / 127.5,
+          ];
+        }),
       ),
     );
 
@@ -167,7 +226,9 @@ class FaceService {
       }
     }
 
-    print('[FACE-S2] Embedding generated (${embedding.length}-d, norm=${norm.toStringAsFixed(3)})');
+    print(
+      '[FACE-S2] Embedding generated (${embedding.length}-d, norm=${norm.toStringAsFixed(3)})',
+    );
     return embedding;
   }
 
@@ -196,7 +257,9 @@ class FaceService {
       }
     }
 
-    print('[FACE-REC] Best match: "$bestName" (distance=${bestDistance.toStringAsFixed(4)}, threshold=$_matchThreshold)');
+    print(
+      '[FACE-REC] Best match: "$bestName" (distance=${bestDistance.toStringAsFixed(4)}, threshold=$_matchThreshold)',
+    );
 
     if (bestName != null && bestDistance < _matchThreshold) {
       final desc = (_vault[bestName]?['description'] as String?) ?? '';
@@ -249,8 +312,48 @@ class FaceService {
     // Persist to disk
     await _saveVault();
 
-    print('[FACE-REG] Saved "$name". Vault now has ${_vault.length} people, '
-          '${_embeddings[name]!.length} embedding(s) for "$name".');
+    print(
+      '[FACE-REG] Saved "$name". Vault now has ${_vault.length} people, '
+      '${_embeddings[name]!.length} embedding(s) for "$name".',
+    );
+  }
+
+  Future<void> deleteRegisteredFace(String name) async {
+    final raw = _vault[name];
+    if (raw is Map<String, dynamic>) {
+      final images =
+          (raw['images'] as List?)
+              ?.map((value) => value.toString())
+              .where((value) => value.isNotEmpty)
+              .toList() ??
+          <String>[];
+
+      for (final imagePath in images) {
+        try {
+          final file = File(imagePath);
+          if (await file.exists()) {
+            await file.delete();
+          }
+        } catch (error) {
+          print('[FACE-REG] Failed to delete image "$imagePath": $error');
+        }
+      }
+    }
+
+    final docsDir = await getApplicationDocumentsDirectory();
+    final faceDir = Directory('${docsDir.path}/faces/$name');
+    if (await faceDir.exists()) {
+      try {
+        await faceDir.delete(recursive: true);
+      } catch (error) {
+        print('[FACE-REG] Failed to delete face directory for "$name": $error');
+      }
+    }
+
+    _vault.remove(name);
+    _embeddings.remove(name);
+    await _saveVault();
+    print('[FACE-REG] Deleted "$name" from the face vault.');
   }
 
   // ---------------------------------------------------------------------------
@@ -282,12 +385,18 @@ class FaceService {
       if (await embFile.exists()) {
         final content = await embFile.readAsString();
         final raw = Map<String, dynamic>.from(jsonDecode(content));
-        _embeddings = raw.map((key, value) => MapEntry(
-          key,
-          (value as List).map<List<double>>(
-            (e) => (e as List).map<double>((v) => (v as num).toDouble()).toList(),
-          ).toList(),
-        ));
+        _embeddings = raw.map(
+          (key, value) => MapEntry(
+            key,
+            (value as List)
+                .map<List<double>>(
+                  (e) => (e as List)
+                      .map<double>((v) => (v as num).toDouble())
+                      .toList(),
+                )
+                .toList(),
+          ),
+        );
         print('[FACE-VAULT] Loaded embeddings: ${_embeddings.length} people.');
       } else {
         _embeddings = {};

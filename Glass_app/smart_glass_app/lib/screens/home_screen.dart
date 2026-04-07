@@ -5,6 +5,7 @@ import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:flutter_background_service/flutter_background_service.dart';
 import 'package:flutter_tts/flutter_tts.dart';
+import 'package:image/image.dart' as img;
 import 'package:image_picker/image_picker.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
@@ -16,10 +17,26 @@ import '../services/background_service.dart';
 import '../services/face_service.dart';
 import '../services/wake_word_config.dart';
 import '../services/wake_word_constants.dart';
+import 'face_vault_screen.dart';
 
-enum _AppState { idle, listening, awaitingDescription, processing }
+enum _AppState {
+  idle,
+  listening,
+  awaitingDescription,
+  awaitingExtraPhotoChoice,
+  processing,
+}
 
 enum _PreviewSource { none, esp32, phoneAttachment }
+
+enum RegistrationStep { idle, askName, askDescription, askForPhonePhoto }
+
+class _RegistrationImageResult {
+  const _RegistrationImageResult({required this.success, this.message});
+
+  final bool success;
+  final String? message;
+}
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -46,19 +63,27 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   String _statusText = 'Initializing...';
   String _lastQuery = '';
+  String _latestRecognizedWords = '';
   String _serverResponse = '';
   String _pendingName = '';
+  String _pendingDescription = '';
   String _wakeWordMessage = WakeWordConfig.hasAccessKey
       ? 'Wake word service preparing...'
       : 'Wake word disabled until PICOVOICE_ACCESS_KEY is provided.';
 
-  Uint8List? _capturedImage;
   String? _attachedImagePath;
+  final List<File> registrationImages = <File>[];
+  final List<_PreviewSource> _registrationImageSources = <_PreviewSource>[];
+  final Set<String> _transientPreviewPaths = <String>{};
+  int _previewFrameIndex = 0;
 
-  bool _isWaitingForDescription = false;
   bool _servicesReady = false;
   bool _wakeWordRunning = false;
   bool _wakeWordReady = WakeWordConfig.hasAccessKey;
+  bool _speechResultInFlight = false;
+  bool _showingRegistrationPairPreview = false;
+  bool isEsp32Capture = false;
+  RegistrationStep _registrationStep = RegistrationStep.idle;
 
   @override
   void initState() {
@@ -141,7 +166,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _initServices() async {
-    _setStatus('Initializing Gemini + Face Engine...', _AppState.idle);
+    _setStatus(
+      'Initializing NVIDIA Phi Vision + Face Engine...',
+      _AppState.idle,
+    );
 
     final bool pendingWakeWord = await _hasPendingWakeWord();
 
@@ -153,14 +181,14 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       _setStatus('Ready - tap the mic.', _AppState.idle);
 
       if (!pendingWakeWord) {
-        _speak('Ready.');
+        await _speak('Ready.');
       }
 
       await _maybeHandlePendingWakeWord();
       await _resumeWakeWordIfIdle();
     } catch (error) {
       _setStatus('Init error: $error', _AppState.idle);
-      _speak('Initialization failed.');
+      await _speak('Initialization failed.');
     }
   }
 
@@ -236,7 +264,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
     if (!_speech.isAvailable) {
       final ok = await _speech.initialize(
-        onError: (error) => debugPrint('[STT] Init error: ${error.errorMsg}'),
+        onStatus: _handleSpeechStatus,
+        onError: _handleSpeechError,
       );
       if (!ok) {
         _setStatus('Mic unavailable', _AppState.idle);
@@ -249,8 +278,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       setState(() {
         _lastQuery = '';
         _serverResponse = '';
-        _isWaitingForDescription = false;
-        _pendingName = '';
+        _resetPendingRegistrationDraft();
       });
     }
 
@@ -263,21 +291,184 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     _listenForSpeech();
   }
 
+  Future<void> _restartSpeechCapture() async {
+    if (!_speech.isAvailable) {
+      final ok = await _speech.initialize(
+        onStatus: _handleSpeechStatus,
+        onError: _handleSpeechError,
+      );
+      if (!ok) {
+        return;
+      }
+    }
+
+    _listenForSpeech();
+  }
+
   void _listenForSpeech() {
+    _latestRecognizedWords = '';
     _speech.listen(
       listenFor: const Duration(seconds: 15),
       pauseFor: const Duration(seconds: 4),
       listenOptions: stt.SpeechListenOptions(partialResults: true),
       onResult: (result) {
-        if (result.recognizedWords.isNotEmpty && mounted) {
-          setState(() => _lastQuery = result.recognizedWords);
+        final recognizedWords = result.recognizedWords.trim();
+        if (recognizedWords.isNotEmpty) {
+          _latestRecognizedWords = recognizedWords;
         }
-        if (result.finalResult) {
-          unawaited(_onSpeechResult(result.recognizedWords));
+        if (recognizedWords.isNotEmpty && mounted) {
+          setState(() => _lastQuery = recognizedWords);
+        }
+        if (_shouldConsumePartialSpeech(recognizedWords)) {
+          unawaited(_consumeSpeechResult(recognizedWords));
+          return;
+        }
+        if (result.finalResult && recognizedWords.isNotEmpty) {
+          unawaited(_consumeSpeechResult(recognizedWords));
         }
       },
       onSoundLevelChange: (_) {},
     );
+  }
+
+  void _handleSpeechStatus(String status) {
+    if (status == stt.SpeechToText.doneStatus ||
+        status == stt.SpeechToText.notListeningStatus) {
+      final fallbackWords = _latestRecognizedWords.trim();
+      if (_shouldConsumePartialSpeech(fallbackWords)) {
+        unawaited(_consumeSpeechResult(fallbackWords));
+      }
+    }
+  }
+
+  void _handleSpeechError(dynamic error) {
+    debugPrint('[STT] Error: ${error.errorMsg} (permanent=${error.permanent})');
+    if (!mounted) {
+      return;
+    }
+
+    if (error.errorMsg.toLowerCase().contains('no_match')) {
+      unawaited(_repromptRegistrationStep());
+    }
+  }
+
+  String? _promptForRegistrationStep({bool isRetry = false}) {
+    switch (_registrationStep) {
+      case RegistrationStep.askName:
+        return isRetry
+            ? 'I did not catch the name. Please say the person name again.'
+            : 'Please say the person name.';
+      case RegistrationStep.askDescription:
+        return isRetry
+            ? 'I did not catch the description. Please say the description again, or say no.'
+            : 'Please say a description for this person, or say no.';
+      case RegistrationStep.askForPhonePhoto:
+        return isRetry
+            ? 'I did not catch that. Do you want to take another photo via phone camera? Say yes or no.'
+            : 'Do you want to take another photo via phone camera? Say yes or no.';
+      case RegistrationStep.idle:
+        return null;
+    }
+  }
+
+  Future<void> _repromptRegistrationStep() async {
+    if (_registrationStep == RegistrationStep.idle ||
+        _speechResultInFlight ||
+        _appState == _AppState.processing) {
+      return;
+    }
+
+    final prompt = _promptForRegistrationStep(isRetry: true);
+    if (prompt == null) {
+      return;
+    }
+
+    final state = _registrationStep == RegistrationStep.askForPhonePhoto
+        ? _AppState.awaitingExtraPhotoChoice
+        : _AppState.awaitingDescription;
+    _setStatus('Listening again...', state);
+    await _speakAndWait(prompt);
+    await _restartSpeechCapture();
+  }
+
+  bool _shouldConsumePartialSpeech(String text) {
+    if (_speechResultInFlight || text.isEmpty) {
+      return false;
+    }
+
+    if (_registrationStep == RegistrationStep.askForPhonePhoto) {
+      final normalized = text.toLowerCase().trim();
+      return _isAffirmative(normalized) || _isNegative(normalized);
+    }
+
+    return false;
+  }
+
+  Future<void> _consumeSpeechResult(String rawText) async {
+    final normalized = rawText.trim();
+    if (normalized.isEmpty || _speechResultInFlight) {
+      return;
+    }
+
+    _speechResultInFlight = true;
+    try {
+      await _speech.stop();
+      await _onSpeechResult(normalized);
+    } finally {
+      _speechResultInFlight = false;
+      _latestRecognizedWords = '';
+    }
+  }
+
+  Future<XFile?> _capturePhoneImageFile() async {
+    return _imagePicker.pickImage(
+      source: ImageSource.camera,
+      preferredCameraDevice: CameraDevice.rear,
+      imageQuality: 90,
+    );
+  }
+
+  Future<XFile?> _captureRegistrationPhoneImageFile() async {
+    final picked = await _capturePhoneImageFile();
+    if (picked != null) {
+      return picked;
+    }
+
+    final lost = await _imagePicker.retrieveLostData();
+    final files = lost.files;
+    if (files != null && files.isNotEmpty) {
+      return files.first;
+    }
+
+    return null;
+  }
+
+  Future<Uint8List> _readOptimizedPhoneImageBytes(XFile file) async {
+    final originalBytes = await file.readAsBytes();
+    return _compressPhoneImageBytes(originalBytes);
+  }
+
+  Uint8List _compressPhoneImageBytes(Uint8List originalBytes) {
+    final decoded = img.decodeImage(originalBytes);
+    if (decoded == null) {
+      return originalBytes;
+    }
+
+    const maxDimension = 1280;
+    img.Image prepared = decoded;
+
+    if (decoded.width > maxDimension || decoded.height > maxDimension) {
+      if (decoded.width >= decoded.height) {
+        prepared = img.copyResize(decoded, width: maxDimension);
+      } else {
+        prepared = img.copyResize(decoded, height: maxDimension);
+      }
+    }
+
+    final compressed = Uint8List.fromList(img.encodeJpg(prepared, quality: 82));
+    return compressed.length <= originalBytes.length
+        ? compressed
+        : originalBytes;
   }
 
   Future<void> _capturePhoneImage() async {
@@ -287,11 +478,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
     await _pauseWakeWord();
     try {
-      final picked = await _imagePicker.pickImage(
-        source: ImageSource.camera,
-        preferredCameraDevice: CameraDevice.rear,
-        imageQuality: 90,
-      );
+      final picked = await _capturePhoneImageFile();
 
       if (picked == null) {
         return;
@@ -309,18 +496,14 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _attachPhoneImage(XFile file, {required bool announce}) async {
-    final bytes = await file.readAsBytes();
+    final bytes = await _readOptimizedPhoneImageBytes(file);
     final savedPath = await _persistAttachedImage(bytes);
-
-    if (!mounted) {
-      return;
+    _setSinglePreviewFile(File(savedPath), _PreviewSource.phoneAttachment);
+    if (mounted) {
+      setState(() {
+        _attachedImagePath = savedPath;
+      });
     }
-
-    setState(() {
-      _attachedImagePath = savedPath;
-      _capturedImage = bytes;
-      _previewSource = _PreviewSource.phoneAttachment;
-    });
 
     if (announce) {
       await _speak('Photo attached. Ask your question.');
@@ -355,17 +538,12 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       await prefs.remove(attachedImagePathKey);
       return;
     }
-
-    final bytes = await file.readAsBytes();
-    if (!mounted) {
-      return;
+    _setSinglePreviewFile(file, _PreviewSource.phoneAttachment);
+    if (mounted) {
+      setState(() {
+        _attachedImagePath = savedPath;
+      });
     }
-
-    setState(() {
-      _attachedImagePath = savedPath;
-      _capturedImage = bytes;
-      _previewSource = _PreviewSource.phoneAttachment;
-    });
   }
 
   Future<void> _recoverLostPhoneCapture() async {
@@ -408,9 +586,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
     setState(() {
       _attachedImagePath = null;
-      if (_previewSource == _PreviewSource.phoneAttachment) {
-        _capturedImage = null;
-        _previewSource = _PreviewSource.none;
+      if (_previewSource == _PreviewSource.phoneAttachment &&
+          !_showingRegistrationPairPreview) {
+        _clearPreview();
       }
     });
   }
@@ -422,14 +600,13 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       return null;
     }
 
-    if (!mounted) {
-      return bytes;
+    final previewFile = await _createPreviewFile(
+      bytes,
+      prefix: 'esp32_preview',
+    );
+    if (previewFile != null) {
+      _setSinglePreviewFile(previewFile, _PreviewSource.esp32);
     }
-
-    setState(() {
-      _capturedImage = bytes;
-      _previewSource = _PreviewSource.esp32;
-    });
 
     return bytes;
   }
@@ -437,13 +614,14 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   Future<Uint8List?> _getImageForRequest() async {
     if (_attachedImagePath != null) {
       try {
-        final bytes = await File(_attachedImagePath!).readAsBytes();
-        if (mounted) {
-          setState(() {
-            _capturedImage = bytes;
-            _previewSource = _PreviewSource.phoneAttachment;
-          });
+        final bytes = await _readAttachedImageBytes();
+        if (bytes == null) {
+          throw StateError('Attached image is unavailable.');
         }
+        _setSinglePreviewFile(
+          File(_attachedImagePath!),
+          _PreviewSource.phoneAttachment,
+        );
         return bytes;
       } catch (error) {
         debugPrint('[ATTACHMENT] Failed to read attached image: $error');
@@ -452,6 +630,25 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     }
 
     return _captureEsp32Image();
+  }
+
+  Future<void> _clearConsumedPhoneAttachmentIfNeeded() async {
+    if (_registrationStep != RegistrationStep.idle) {
+      return;
+    }
+
+    if (_attachedImagePath == null) {
+      return;
+    }
+
+    await _clearAttachedImage();
+  }
+
+  Future<Uint8List?> _readAttachedImageBytes() async {
+    if (_attachedImagePath == null) {
+      return null;
+    }
+    return File(_attachedImagePath!).readAsBytes();
   }
 
   Future<String?> _saveBytesToFile(Uint8List bytes) async {
@@ -467,6 +664,20 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     }
   }
 
+  Future<File?> _createPreviewFile(
+    Uint8List bytes, {
+    required String prefix,
+  }) async {
+    final path = await _saveBytesToFile(bytes);
+    if (path == null) {
+      return null;
+    }
+
+    final file = File(path);
+    _transientPreviewPaths.add(file.path);
+    return file;
+  }
+
   void _cleanup(List<String?> paths) {
     for (final path in paths) {
       if (path == null) {
@@ -479,6 +690,121 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     }
   }
 
+  void _setSinglePreviewFile(File file, _PreviewSource source) {
+    if (!mounted) {
+      return;
+    }
+
+    setState(() {
+      _previewSource = source;
+      registrationImages
+        ..clear()
+        ..add(file);
+      _registrationImageSources
+        ..clear()
+        ..add(source);
+      _previewFrameIndex = 0;
+      _showingRegistrationPairPreview = false;
+    });
+  }
+
+  void _setRegistrationPairPreviewFiles({
+    required File phoneFile,
+    required File esp32File,
+  }) {
+    if (!mounted) {
+      return;
+    }
+
+    setState(() {
+      _previewSource = _PreviewSource.phoneAttachment;
+      registrationImages
+        ..clear()
+        ..add(phoneFile)
+        ..add(esp32File);
+      _registrationImageSources
+        ..clear()
+        ..add(_PreviewSource.phoneAttachment)
+        ..add(_PreviewSource.esp32);
+      _previewFrameIndex = 0;
+      _showingRegistrationPairPreview = true;
+    });
+  }
+
+  void _clearPreview() {
+    _previewSource = _PreviewSource.none;
+    for (final path in _transientPreviewPaths) {
+      try {
+        File(path).deleteSync();
+      } catch (_) {}
+    }
+    _transientPreviewPaths.clear();
+    registrationImages.clear();
+    _registrationImageSources.clear();
+    _previewFrameIndex = 0;
+    _showingRegistrationPairPreview = false;
+  }
+
+  void _resetPendingRegistrationDraft() {
+    _pendingName = '';
+    _pendingDescription = '';
+    isEsp32Capture = false;
+    _registrationStep = RegistrationStep.idle;
+  }
+
+  Future<void> _beginFaceRegistration(String extractedName) async {
+    _resetPendingRegistrationDraft();
+    _clearPreview();
+
+    Uint8List? primaryBytes;
+
+    if (!_hasAttachedImage) {
+      _setStatus('Capturing image...', _AppState.processing);
+      primaryBytes = await _captureEsp32Image();
+    } else {
+      primaryBytes = await _readAttachedImageBytes();
+      if (_attachedImagePath != null) {
+        _setSinglePreviewFile(
+          File(_attachedImagePath!),
+          _PreviewSource.phoneAttachment,
+        );
+      }
+    }
+
+    if (primaryBytes == null) {
+      _setStatus('Camera error', _AppState.idle);
+      await _speak('I could not capture the image for registration.');
+      await _resumeWakeWordIfIdle();
+      return;
+    }
+
+    if (mounted) {
+      setState(() {
+        _pendingName = extractedName;
+        _pendingDescription = '';
+        isEsp32Capture = !_hasAttachedImage;
+        _registrationStep = extractedName == 'Unknown'
+            ? RegistrationStep.askName
+            : RegistrationStep.askDescription;
+      });
+    }
+
+    if (_registrationStep == RegistrationStep.askName) {
+      _setStatus('Say the person name', _AppState.awaitingDescription);
+      await _speakAndWait('Please say the person name.');
+    } else {
+      _setStatus(
+        'Say description -> $extractedName',
+        _AppState.awaitingDescription,
+      );
+      await _speakAndWait(
+        'I heard $extractedName. Please say a description for this person, or say no.',
+      );
+    }
+
+    await _restartSpeechCapture();
+  }
+
   Future<void> _onSpeechResult(String rawText) async {
     final text = rawText.toLowerCase().trim();
     if (text.isEmpty) {
@@ -487,42 +813,75 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       return;
     }
 
-    await _speech.stop();
+    if (_registrationStep == RegistrationStep.askName) {
+      _pendingName = rawText.trim();
+      _registrationStep = RegistrationStep.askDescription;
+      _setStatus(
+        'Say description -> $_pendingName',
+        _AppState.awaitingDescription,
+      );
+      await _speakAndWait(
+        'I heard $_pendingName. Please say a description for this person, or say no.',
+      );
+      await _restartSpeechCapture();
+      return;
+    }
 
-    if (_isWaitingForDescription) {
-      _isWaitingForDescription = false;
-      final description = text.contains('no') && text.split(' ').length <= 3
+    if (_registrationStep == RegistrationStep.askDescription) {
+      _pendingDescription = text.contains('no') && text.split(' ').length <= 3
           ? ''
           : rawText.trim();
-      await _executeRegistration(_pendingName, description);
+
+      if (isEsp32Capture) {
+        _registrationStep = RegistrationStep.askForPhonePhoto;
+        _setStatus(
+          'Need another phone photo? Say yes or no.',
+          _AppState.awaitingExtraPhotoChoice,
+        );
+        await _speakAndWait(
+          'Do you want to take another photo using your phone camera? Say yes or no.',
+        );
+        await _restartSpeechCapture();
+      } else {
+        await _executeRegistration(
+          _pendingName,
+          _pendingDescription,
+          captureExtraPhonePhoto: false,
+        );
+      }
+      return;
+    }
+
+    if (_registrationStep == RegistrationStep.askForPhonePhoto) {
+      if (_isAffirmative(text)) {
+        _registrationStep = RegistrationStep.idle;
+        await _executeRegistration(
+          _pendingName,
+          _pendingDescription,
+          captureExtraPhonePhoto: true,
+        );
+        return;
+      }
+
+      if (_isNegative(text)) {
+        _registrationStep = RegistrationStep.idle;
+        await _executeRegistration(
+          _pendingName,
+          _pendingDescription,
+          captureExtraPhonePhoto: false,
+        );
+        return;
+      }
+
+      _setStatus('Please say yes or no.', _AppState.awaitingExtraPhotoChoice);
+      await _speakAndWait('Please say yes or no.');
+      await _restartSpeechCapture();
       return;
     }
 
     if (_matchesFaceRegister(text)) {
       final extractedName = _extractName(rawText);
-
-      if (mounted) {
-        setState(() {
-          _pendingName = extractedName;
-          _isWaitingForDescription = true;
-        });
-      }
-
-      _setStatus(
-        'Say description -> $extractedName',
-        _AppState.awaitingDescription,
-      );
-      await _speakAndWait(
-        'I heard $extractedName. Please say a description for this person, or say no.',
-      );
-
-      if (!_speech.isAvailable) {
-        await _speech.initialize(
-          onError: (error) => debugPrint('[STT] Error: ${error.errorMsg}'),
-        );
-      }
-
-      _listenForSpeech();
+      await _beginFaceRegistration(extractedName);
       return;
     }
 
@@ -531,7 +890,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       return;
     }
 
-    await _handleGeminiVision(rawText);
+    await _handleVisionQuery(rawText);
   }
 
   bool _matchesFaceRegister(String text) {
@@ -640,55 +999,31 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       debugPrint('[RECOGNIZE] Error: $error');
     } finally {
       _cleanup([imagePath, cropPath]);
+      await _clearConsumedPhoneAttachmentIfNeeded();
       await _resumeWakeWordIfIdle();
     }
   }
 
-  Future<void> _executeRegistration(String name, String description) async {
-    _setStatus(
-      _hasAttachedImage ? 'Using attached photo...' : 'Capturing image...',
-      _AppState.processing,
-    );
-
-    await _speakAndWait(
-      _hasAttachedImage
-          ? 'Registering from the attached photo.'
-          : 'Registering. Please hold still.',
-    );
-
-    final bytes = await _getImageForRequest();
-    if (bytes == null) {
-      _pendingName = '';
-      _setStatus('Camera error', _AppState.idle);
-      await _resumeWakeWordIfIdle();
-      return;
+  Future<_RegistrationImageResult> _registerFaceFile({
+    required String name,
+    required String description,
+    required File imageFile,
+  }) async {
+    if (!await imageFile.exists()) {
+      return const _RegistrationImageResult(
+        success: false,
+        message: 'I could not prepare the image for registration.',
+      );
     }
 
-    final imagePath = await _saveBytesToFile(bytes);
-    if (imagePath == null) {
-      _pendingName = '';
-      _setStatus('File error', _AppState.idle);
-      await _resumeWakeWordIfIdle();
-      return;
-    }
-
-    _setStatus('Detecting face...', _AppState.processing);
-    final cropPath = await _faceService.detectAndCropFace(imagePath);
-
+    final cropPath = await _faceService.detectAndCropFace(imageFile.path);
     if (cropPath == null) {
-      const message = 'I could not detect a face. Please try again.';
-      if (mounted) {
-        setState(() => _serverResponse = message);
-      }
-      _pendingName = '';
-      _setStatus('No face', _AppState.idle);
-      await _speak(message);
-      _cleanup([imagePath]);
-      await _resumeWakeWordIfIdle();
-      return;
+      return const _RegistrationImageResult(
+        success: false,
+        message: 'I could not detect a face in one of the photos.',
+      );
     }
 
-    _setStatus('Saving $name...', _AppState.processing);
     try {
       final embedding = _faceService.getEmbedding(cropPath);
       await _faceService.registerFace(
@@ -697,37 +1032,131 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         embedding: embedding,
         cropPath: cropPath,
       );
-
-      final descriptionPart = description.isNotEmpty
-          ? ' Description: $description.'
-          : '';
-      final message = 'Successfully registered $name.$descriptionPart';
-
-      if (mounted) {
-        setState(() {
-          _serverResponse = message;
-          _pendingName = '';
-        });
-      }
-      _setStatus('Registered: $name', _AppState.idle);
-      await _speak(message);
+      return const _RegistrationImageResult(success: true);
     } catch (error) {
-      if (mounted) {
-        setState(() {
-          _serverResponse = 'Registration failed.';
-          _pendingName = '';
-        });
-      }
-      _setStatus('Error', _AppState.idle);
-      await _speak('Registration failed. Please try again.');
-      debugPrint('[REGISTER] Error: $error');
+      debugPrint('[REGISTER] Error while saving face image: $error');
+      return const _RegistrationImageResult(
+        success: false,
+        message: 'Registration failed while saving a face photo.',
+      );
     } finally {
-      _cleanup([imagePath, cropPath]);
-      await _resumeWakeWordIfIdle();
+      _cleanup([cropPath]);
     }
   }
 
-  Future<void> _handleGeminiVision(String query) async {
+  Future<void> _executeRegistration(
+    String name,
+    String description, {
+    required bool captureExtraPhonePhoto,
+  }) async {
+    _setStatus(
+      isEsp32Capture
+          ? 'Registering ESP32 photo...'
+          : 'Registering phone photo...',
+      _AppState.processing,
+    );
+
+    await _speakAndWait(
+      isEsp32Capture
+          ? 'Registering the captured ESP32 image.'
+          : _hasAttachedImage
+          ? 'Registering from the attached photo.'
+          : 'Registering. Please hold still.',
+    );
+
+    if (registrationImages.isEmpty) {
+      _resetPendingRegistrationDraft();
+      _setStatus('Camera error', _AppState.idle);
+      await _resumeWakeWordIfIdle();
+      return;
+    }
+
+    var savedPhotos = 0;
+    var message = '';
+
+    if (captureExtraPhonePhoto) {
+      _setStatus('Opening phone camera...', _AppState.processing);
+      await _speakAndWait('Open the phone camera and take the picture.');
+
+      try {
+        await _speech.cancel();
+        await Future<void>.delayed(const Duration(milliseconds: 500));
+        final phonePhoto = await _captureRegistrationPhoneImageFile();
+        if (phonePhoto != null) {
+          final phoneBytes = await _readOptimizedPhoneImageBytes(phonePhoto);
+          final phonePreviewFile = await _createPreviewFile(
+            phoneBytes,
+            prefix: 'phone_registration',
+          );
+          final esp32PreviewFile = registrationImages.first;
+          if (phonePreviewFile != null) {
+            _setRegistrationPairPreviewFiles(
+              phoneFile: phonePreviewFile,
+              esp32File: esp32PreviewFile,
+            );
+          }
+        } else {
+          message = 'Phone photo was skipped.';
+        }
+      } catch (error) {
+        debugPrint('[REGISTER] Phone photo error: $error');
+        message = 'Phone camera failed.';
+      }
+    }
+
+    final imagesToSave = List<File>.from(registrationImages);
+    for (final imageFile in imagesToSave) {
+      final result = await _registerFaceFile(
+        name: name,
+        description: description,
+        imageFile: imageFile,
+      );
+      if (!result.success) {
+        if (savedPhotos == 0) {
+          message = result.message ?? 'Registration failed.';
+          if (mounted) {
+            setState(() => _serverResponse = message);
+          }
+          _resetPendingRegistrationDraft();
+          _setStatus('No face', _AppState.idle);
+          await _speak(message);
+          await _resumeWakeWordIfIdle();
+          return;
+        }
+        message =
+            'Saved $savedPhotos photo${savedPhotos == 1 ? '' : 's'} for $name, but one image could not be used.';
+        break;
+      }
+      savedPhotos++;
+    }
+
+    if (savedPhotos > 0) {
+      var successMessage = 'Person marked successfully.';
+      if (savedPhotos > 1) {
+        successMessage = 'Person marked successfully with $savedPhotos photos.';
+      }
+      if (message.isEmpty) {
+        message = successMessage;
+      } else {
+        message = '$successMessage $message';
+      }
+      if (description.isNotEmpty) {
+        message = '$message Description: $description.';
+      }
+    }
+
+    if (mounted) {
+      setState(() {
+        _serverResponse = message;
+        _resetPendingRegistrationDraft();
+      });
+    }
+    _setStatus('Registered: $name', _AppState.idle);
+    await _speak(message);
+    await _resumeWakeWordIfIdle();
+  }
+
+  Future<void> _handleVisionQuery(String query) async {
     _setStatus(
       _hasAttachedImage ? 'Using attached photo...' : 'Capturing image...',
       _AppState.processing,
@@ -746,7 +1175,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       return;
     }
 
-    _setStatus('Asking Gemini...', _AppState.processing);
+    _setStatus('Asking NVIDIA Phi Vision...', _AppState.processing);
     final response = await _apiService.analyzeImage(bytes, query);
 
     if (mounted) {
@@ -754,6 +1183,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     }
     _setStatus('Done', _AppState.idle);
     await _speak(response);
+    await _clearConsumedPhoneAttachmentIfNeeded();
     await _resumeWakeWordIfIdle();
   }
 
@@ -761,8 +1191,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     await _speech.stop();
     if (mounted) {
       setState(() {
-        _isWaitingForDescription = false;
-        _pendingName = '';
+        _resetPendingRegistrationDraft();
       });
     }
     _setStatus('Cancelled', _AppState.idle);
@@ -770,11 +1199,23 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     await _resumeWakeWordIfIdle();
   }
 
+  Future<void> _openFaceVault() async {
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => FaceVaultScreen(faceService: _faceService),
+      ),
+    );
+    if (mounted) {
+      setState(() {});
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final isActive =
         _appState == _AppState.listening ||
-        _appState == _AppState.awaitingDescription;
+        _appState == _AppState.awaitingDescription ||
+        _appState == _AppState.awaitingExtraPhotoChoice;
     final isProcessing = _appState == _AppState.processing;
     final cameraActionDisabled = isActive || isProcessing;
 
@@ -787,6 +1228,13 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
         ),
         centerTitle: true,
+        actions: [
+          IconButton(
+            onPressed: _openFaceVault,
+            icon: const Icon(Icons.people_alt_outlined, color: Colors.white),
+            tooltip: 'Face Vault',
+          ),
+        ],
       ),
       body: SingleChildScrollView(
         padding: const EdgeInsets.all(20),
@@ -798,7 +1246,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                 Icon(Icons.cloud_done, color: Colors.green, size: 16),
                 SizedBox(width: 6),
                 Text(
-                  'Gemini Direct (no backend)',
+                  'NVIDIA Phi-3.5 Vision',
                   style: TextStyle(color: Colors.grey, fontSize: 13),
                 ),
               ],
@@ -957,6 +1405,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       case _AppState.awaitingDescription:
         chipColor = Colors.amber.shade700;
         break;
+      case _AppState.awaitingExtraPhotoChoice:
+        chipColor = Colors.teal.shade700;
+        break;
       case _AppState.processing:
         chipColor = Colors.purple.shade700;
         break;
@@ -1006,13 +1457,15 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         return Icons.mic;
       case _AppState.awaitingDescription:
         return Icons.record_voice_over;
+      case _AppState.awaitingExtraPhotoChoice:
+        return Icons.add_a_photo_outlined;
       case _AppState.processing:
         return Icons.hourglass_top;
     }
   }
 
   Widget _buildImagePreview() {
-    if (_capturedImage != null) {
+    if (registrationImages.isNotEmpty) {
       return ClipRRect(
         borderRadius: BorderRadius.circular(12),
         child: Container(
@@ -1021,7 +1474,65 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             border: Border.all(color: const Color(0xFF30363D)),
             borderRadius: BorderRadius.circular(12),
           ),
-          child: Image.memory(_capturedImage!, fit: BoxFit.cover),
+          child: Stack(
+            children: [
+              PageView.builder(
+                itemCount: registrationImages.length,
+                onPageChanged: (index) {
+                  if (!mounted) {
+                    return;
+                  }
+                  setState(() {
+                    _previewFrameIndex = index;
+                    _previewSource = _registrationImageSources[index];
+                  });
+                },
+                itemBuilder: (context, index) {
+                  return Image.file(
+                    registrationImages[index],
+                    fit: BoxFit.cover,
+                  );
+                },
+              ),
+              if (registrationImages.length > 1)
+                Positioned(
+                  top: 12,
+                  right: 12,
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 10,
+                      vertical: 6,
+                    ),
+                    decoration: BoxDecoration(
+                      color: Colors.black54,
+                      borderRadius: BorderRadius.circular(999),
+                    ),
+                    child: Text(
+                      '${_previewFrameIndex + 1}/${registrationImages.length}',
+                      style: const TextStyle(color: Colors.white),
+                    ),
+                  ),
+                ),
+              Positioned(
+                left: 12,
+                bottom: 12,
+                child: Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 10,
+                    vertical: 6,
+                  ),
+                  decoration: BoxDecoration(
+                    color: Colors.black54,
+                    borderRadius: BorderRadius.circular(999),
+                  ),
+                  child: Text(
+                    _previewLabelAt(_previewFrameIndex),
+                    style: const TextStyle(color: Colors.white),
+                  ),
+                ),
+              ),
+            ],
+          ),
         ),
       );
     }
@@ -1047,7 +1558,26 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     );
   }
 
+  String _previewLabelAt(int index) {
+    if (index < 0 || index >= _registrationImageSources.length) {
+      return 'Preview';
+    }
+
+    switch (_registrationImageSources[index]) {
+      case _PreviewSource.phoneAttachment:
+        return 'Phone camera';
+      case _PreviewSource.esp32:
+        return 'ESP32-CAM';
+      case _PreviewSource.none:
+        return 'Preview';
+    }
+  }
+
   String _previewDescription() {
+    if (_showingRegistrationPairPreview) {
+      return 'Registration preview: phone photo first. Swipe from right to left to view the ESP32 photo of the same person.';
+    }
+
     switch (_previewSource) {
       case _PreviewSource.phoneAttachment:
         return 'Current source: attached phone-camera image.';
@@ -1057,4 +1587,14 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         return 'Ask a question to use ESP32-CAM, or attach a photo from the phone camera.';
     }
   }
+}
+
+bool _isAffirmative(String text) {
+  return RegExp(
+    r'\b(?:yes|yeah|yep|sure|ok|okay|please|do it|open|take)\b',
+  ).hasMatch(text);
+}
+
+bool _isNegative(String text) {
+  return RegExp(r'\b(?:no|nope|nah|skip|cancel)\b').hasMatch(text);
 }
