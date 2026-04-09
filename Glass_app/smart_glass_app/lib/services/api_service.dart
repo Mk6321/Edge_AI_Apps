@@ -1,8 +1,10 @@
 import 'dart:convert';
 import 'dart:io';
-import 'dart:typed_data';
 
+import 'package:flutter/foundation.dart';
+import 'package:google_mlkit_text_recognition/google_mlkit_text_recognition.dart';
 import 'package:http/http.dart' as http;
+import 'package:path_provider/path_provider.dart';
 
 /// API service for Smart Glass.
 ///
@@ -44,11 +46,18 @@ class ApiService {
       if (response.statusCode == 200) {
         return response.bodyBytes;
       }
-    } catch (_) {}
+      debugPrint('ERROR: ESP32 returned status ${response.statusCode}');
+    } catch (error) {
+      debugPrint('ERROR: $error');
+    }
     return null;
   }
 
   Future<String> analyzeImage(Uint8List imageBytes, String query) async {
+    if (_isOcrQuery(query)) {
+      return _extractTextLocally(imageBytes);
+    }
+
     final systemPrompt = _pickSystemPrompt(query);
     final base64Image = base64Encode(imageBytes);
 
@@ -97,17 +106,15 @@ class ApiService {
             title?.toString() ??
             _plainErrorText(response.body) ??
             'Request failed.';
-        if (response.statusCode == 429) {
-          return 'NVIDIA API rate limit reached. Please wait a moment and try again.';
-        }
-        if (response.statusCode == 404) {
-          return 'NVIDIA API endpoint not found. Please verify the configured URL and model.';
-        }
-        return 'NVIDIA API error: $message';
+        debugPrint(
+          'ERROR: Vision request failed with status ${response.statusCode}: $message',
+        );
+        return '';
       }
 
       if (body == null) {
-        return 'NVIDIA API error: invalid response format.';
+        debugPrint('ERROR: Vision API returned invalid response format.');
+        return '';
       }
 
       final choices = body['choices'];
@@ -116,15 +123,20 @@ class ApiService {
       }
 
       final message = choices.first['message'];
-      final content = message is Map<String, dynamic> ? message['content'] : null;
+      final content = message is Map<String, dynamic>
+          ? message['content']
+          : null;
       final text = _extractTextContent(content);
       return text.isEmpty ? 'No response generated.' : text;
     } on SocketException {
-      return 'NVIDIA API network error. Please check your internet connection and try again.';
+      debugPrint('ERROR: Vision API network error.');
+      return '';
     } on FormatException {
-      return 'NVIDIA API returned an unexpected response. Please try again.';
+      debugPrint('ERROR: Vision API returned an unexpected response.');
+      return '';
     } catch (error) {
-      return 'NVIDIA API error: $error';
+      debugPrint('ERROR: $error');
+      return '';
     }
   }
 
@@ -134,8 +146,43 @@ class ApiService {
       if (decoded is Map<String, dynamic>) {
         return decoded;
       }
-    } catch (_) {}
+    } catch (error) {
+      debugPrint('ERROR: $error');
+    }
     return null;
+  }
+
+  Future<String> _extractTextLocally(Uint8List imageBytes) async {
+    final textRecognizer = TextRecognizer(
+      script: TextRecognitionScript.devanagiri,
+    );
+    String? tempPath;
+
+    try {
+      final tempDir = await getTemporaryDirectory();
+      tempPath =
+          '${tempDir.path}/smart_glass_ocr_${DateTime.now().millisecondsSinceEpoch}.jpg';
+      final file = File(tempPath);
+      await file.writeAsBytes(imageBytes, flush: true);
+
+      final inputImage = InputImage.fromFilePath(file.path);
+      final recognizedText = await textRecognizer.processImage(inputImage);
+      final text = recognizedText.text.trim();
+      return text.isEmpty ? 'No text found in the image.' : text;
+    } catch (error) {
+      debugPrint('ERROR: $error');
+      return '';
+    } finally {
+      await textRecognizer.close();
+      if (tempPath != null) {
+        try {
+          final file = File(tempPath);
+          if (await file.exists()) {
+            await file.delete();
+          }
+        } catch (_) {}
+      }
+    }
   }
 
   String? _plainErrorText(String body) {
@@ -167,6 +214,13 @@ class ApiService {
     return '';
   }
 
+  bool _isOcrQuery(String query) {
+    final q = query.toLowerCase();
+    return RegExp(
+      r'\b(?:read|extract(?:ion|ing|ed)?|text|passage|document|words?|letters?|sign|says|written)\b',
+    ).hasMatch(q);
+  }
+
   String _pickSystemPrompt(String query) {
     final q = query.toLowerCase();
 
@@ -176,9 +230,7 @@ class ApiService {
       return _currencySystemPrompt;
     }
 
-    if (RegExp(
-      r'\b(?:read|text|passage|document|words?|letters?|sign|says|written)\b',
-    ).hasMatch(q)) {
+    if (_isOcrQuery(q)) {
       return _ocrSystemPrompt;
     }
 

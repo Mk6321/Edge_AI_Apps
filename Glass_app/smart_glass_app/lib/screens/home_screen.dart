@@ -3,7 +3,6 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
-import 'package:flutter_background_service/flutter_background_service.dart';
 import 'package:flutter_tts/flutter_tts.dart';
 import 'package:image/image.dart' as img;
 import 'package:image_picker/image_picker.dart';
@@ -13,10 +12,8 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:speech_to_text/speech_to_text.dart' as stt;
 
 import '../services/api_service.dart';
-import '../services/background_service.dart';
 import '../services/face_service.dart';
-import '../services/wake_word_config.dart';
-import '../services/wake_word_constants.dart';
+import '../services/vosk_service.dart';
 import 'face_vault_screen.dart';
 
 enum _AppState {
@@ -30,6 +27,8 @@ enum _AppState {
 enum _PreviewSource { none, esp32, phoneAttachment }
 
 enum RegistrationStep { idle, askName, askDescription, askForPhonePhoto }
+
+const String _attachedImagePathKey = 'attached_image_path';
 
 class _RegistrationImageResult {
   const _RegistrationImageResult({required this.success, this.message});
@@ -49,14 +48,12 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   final ApiService _apiService = ApiService();
   final FaceService _faceService = FaceService();
   final ImagePicker _imagePicker = ImagePicker();
-  final FlutterBackgroundService _backgroundService =
-      FlutterBackgroundService();
+  final VoskService _wakeWordService = VoskService();
 
   late stt.SpeechToText _speech;
   late FlutterTts _flutterTts;
 
-  StreamSubscription<Map<String, dynamic>?>? _wakeWordDetectedSubscription;
-  StreamSubscription<Map<String, dynamic>?>? _wakeWordStatusSubscription;
+  StreamSubscription<String>? _wakeWordDetectedSubscription;
 
   _AppState _appState = _AppState.idle;
   _PreviewSource _previewSource = _PreviewSource.none;
@@ -67,9 +64,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   String _serverResponse = '';
   String _pendingName = '';
   String _pendingDescription = '';
-  String _wakeWordMessage = WakeWordConfig.hasAccessKey
-      ? 'Wake word service preparing...'
-      : 'Wake word disabled until PICOVOICE_ACCESS_KEY is provided.';
 
   String? _attachedImagePath;
   final List<File> registrationImages = <File>[];
@@ -77,9 +71,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   final Set<String> _transientPreviewPaths = <String>{};
   int _previewFrameIndex = 0;
 
-  bool _servicesReady = false;
-  bool _wakeWordRunning = false;
-  bool _wakeWordReady = WakeWordConfig.hasAccessKey;
   bool _speechResultInFlight = false;
   bool _showingRegistrationPairPreview = false;
   bool isEsp32Capture = false;
@@ -97,10 +88,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _wakeWordDetectedSubscription?.cancel();
-    _wakeWordStatusSubscription?.cancel();
     _speech.cancel();
     _flutterTts.stop();
-    unawaited(_resumeWakeWordIfIdle());
+    unawaited(_wakeWordService.dispose());
     unawaited(_faceService.dispose());
     super.dispose();
   }
@@ -108,7 +98,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
-      unawaited(_maybeHandlePendingWakeWord());
+      unawaited(_resumeWakeWordIfIdle());
     }
   }
 
@@ -117,35 +107,17 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   Future<void> _bootstrap() async {
     await _initVoice();
     await _requestPermissions();
-    await initializeService();
     await _restoreAttachedImage();
     await _recoverLostPhoneCapture();
     await _initServices();
   }
 
   void _bindWakeWordStreams() {
-    _wakeWordDetectedSubscription = _backgroundService
-        .on(wakeWordDetectedEvent)
-        .listen((_) {
-          unawaited(_maybeHandlePendingWakeWord());
-        });
-
-    _wakeWordStatusSubscription = _backgroundService
-        .on(wakeWordStatusEvent)
-        .listen((event) {
-          if (!mounted || event == null) {
-            return;
-          }
-
-          setState(() {
-            _wakeWordReady = event['ready'] == true;
-            _wakeWordRunning = event['running'] == true;
-            final message = event['message'] as String?;
-            if (message != null && message.isNotEmpty) {
-              _wakeWordMessage = message;
-            }
-          });
-        });
+    _wakeWordDetectedSubscription = _wakeWordService.onWakeWordDetected.listen((
+      _,
+    ) {
+      unawaited(_startListening(fromWakeWord: true));
+    });
   }
 
   Future<void> _requestPermissions() async {
@@ -167,28 +139,20 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   Future<void> _initServices() async {
     _setStatus(
-      'Initializing NVIDIA Phi Vision + Face Engine...',
+      'Initializing Vision Assistant + Face Engine...',
       _AppState.idle,
     );
-
-    final bool pendingWakeWord = await _hasPendingWakeWord();
 
     try {
       await _apiService.init();
       await _faceService.initialize();
+      await _wakeWordService.initialize();
 
-      _servicesReady = true;
-      _setStatus('Ready - tap the mic.', _AppState.idle);
-
-      if (!pendingWakeWord) {
-        await _speak('Ready.');
-      }
-
-      await _maybeHandlePendingWakeWord();
-      await _resumeWakeWordIfIdle();
+      _setIdleState();
+      await _speakAndWait('Ready.', resumeWakeWord: true);
     } catch (error) {
-      _setStatus('Init error: $error', _AppState.idle);
-      await _speak('Initialization failed.');
+      debugPrint('ERROR: $error');
+      _setIdleState(clearResponse: true);
     }
   }
 
@@ -203,55 +167,78 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     });
   }
 
+  void _setIdleState({bool clearResponse = false}) {
+    if (!mounted) {
+      return;
+    }
+
+    setState(() {
+      _statusText = 'Ready - tap the mic.';
+      _appState = _AppState.idle;
+      if (clearResponse) {
+        _serverResponse = '';
+      }
+    });
+  }
+
   Future<void> _pauseWakeWord() async {
-    await pauseWakeWordDetection();
+    await _wakeWordService.pauseListening();
   }
 
   Future<void> _resumeWakeWordIfIdle() async {
     if (_appState == _AppState.idle) {
-      await resumeWakeWordDetection();
+      await _wakeWordService.resumeListening();
     }
   }
 
-  Future<void> _speak(String text) async {
-    await _flutterTts.speak(text);
+  Future<void> _stopSpeechCapture() async {
+    try {
+      await _speech.stop();
+    } catch (error) {
+      debugPrint('ERROR: $error');
+    }
   }
 
-  Future<void> _speakAndWait(String text) async {
+  Future<void> _prepareAudioForTts() async {
+    await _stopSpeechCapture();
+    try {
+      await _wakeWordService.pauseListening();
+    } catch (error) {
+      debugPrint('ERROR: $error');
+    }
+  }
+
+  Future<void> _speakAndWait(String text, {bool resumeWakeWord = false}) async {
     final completer = Completer<void>();
+    await _prepareAudioForTts();
     _flutterTts.setCompletionHandler(() {
+      if (resumeWakeWord) {
+        unawaited(_resumeWakeWordIfIdle());
+      }
       if (!completer.isCompleted) {
         completer.complete();
       }
     });
+    _flutterTts.setCancelHandler(() {
+      if (resumeWakeWord) {
+        unawaited(_resumeWakeWordIfIdle());
+      }
+      if (!completer.isCompleted) {
+        completer.complete();
+      }
+    });
+    _flutterTts.setErrorHandler((message) {
+      debugPrint('ERROR: $message');
+      if (resumeWakeWord) {
+        unawaited(_resumeWakeWordIfIdle());
+      }
+      if (!completer.isCompleted) {
+        completer.complete();
+      }
+    });
+    await _flutterTts.stop();
     await _flutterTts.speak(text);
     await completer.future;
-  }
-
-  Future<bool> _hasPendingWakeWord() async {
-    final prefs = await SharedPreferences.getInstance();
-    return prefs.getBool(pendingWakeWordKey) ?? false;
-  }
-
-  Future<void> _clearPendingWakeWord() async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.remove(pendingWakeWordKey);
-    await prefs.remove(pendingWakeWordAtKey);
-  }
-
-  Future<void> _maybeHandlePendingWakeWord() async {
-    if (!_servicesReady || _appState != _AppState.idle) {
-      return;
-    }
-
-    final prefs = await SharedPreferences.getInstance();
-    final pending = prefs.getBool(pendingWakeWordKey) ?? false;
-    if (!pending) {
-      return;
-    }
-
-    await _clearPendingWakeWord();
-    await _startListening(fromWakeWord: true);
   }
 
   Future<void> _startListening({bool fromWakeWord = false}) async {
@@ -260,7 +247,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     }
 
     await _pauseWakeWord();
-    await _clearPendingWakeWord();
 
     if (!_speech.isAvailable) {
       final ok = await _speech.initialize(
@@ -268,7 +254,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         onError: _handleSpeechError,
       );
       if (!ok) {
-        _setStatus('Mic unavailable', _AppState.idle);
+        debugPrint('ERROR: Speech recognition unavailable.');
+        _setIdleState();
         await _resumeWakeWordIfIdle();
         return;
       }
@@ -349,7 +336,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
     if (error.errorMsg.toLowerCase().contains('no_match')) {
       unawaited(_repromptRegistrationStep());
+      return;
     }
+
+    _setIdleState();
+    unawaited(_resumeWakeWordIfIdle());
   }
 
   String? _promptForRegistrationStep({bool isRetry = false}) {
@@ -485,11 +476,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       }
 
       await _attachPhoneImage(picked, announce: true);
-      _setStatus('Phone image attached', _AppState.idle);
+      _setIdleState();
     } catch (error) {
-      _setStatus('Phone camera error', _AppState.idle);
-      await _speak('I could not capture a photo from the phone camera.');
-      debugPrint('[PHONE-CAMERA] Error: $error');
+      debugPrint('ERROR: $error');
+      _setIdleState();
     } finally {
       await _resumeWakeWordIfIdle();
     }
@@ -506,7 +496,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     }
 
     if (announce) {
-      await _speak('Photo attached. Ask your question.');
+      await _speakAndWait(
+        'Photo attached. Ask your question.',
+        resumeWakeWord: true,
+      );
     }
   }
 
@@ -517,25 +510,40 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       await attachmentsDir.create(recursive: true);
     }
 
-    final file = File('${attachmentsDir.path}/latest_phone_capture.jpg');
+    final previousPath = _attachedImagePath;
+    final file = File(
+      '${attachmentsDir.path}/phone_capture_${DateTime.now().millisecondsSinceEpoch}.jpg',
+    );
     await file.writeAsBytes(bytes, flush: true);
 
+    if (previousPath != null && previousPath != file.path) {
+      try {
+        await FileImage(File(previousPath)).evict();
+      } catch (_) {}
+      try {
+        final previousFile = File(previousPath);
+        if (await previousFile.exists()) {
+          await previousFile.delete();
+        }
+      } catch (_) {}
+    }
+
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(attachedImagePathKey, file.path);
+    await prefs.setString(_attachedImagePathKey, file.path);
 
     return file.path;
   }
 
   Future<void> _restoreAttachedImage() async {
     final prefs = await SharedPreferences.getInstance();
-    final savedPath = prefs.getString(attachedImagePathKey);
+    final savedPath = prefs.getString(_attachedImagePathKey);
     if (savedPath == null) {
       return;
     }
 
     final file = File(savedPath);
     if (!await file.exists()) {
-      await prefs.remove(attachedImagePathKey);
+      await prefs.remove(_attachedImagePathKey);
       return;
     }
     _setSinglePreviewFile(file, _PreviewSource.phoneAttachment);
@@ -555,7 +563,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     final files = response.files;
     if (files != null && files.isNotEmpty) {
       await _attachPhoneImage(files.first, announce: false);
-      _setStatus('Recovered phone image', _AppState.idle);
+      _setIdleState();
       return;
     }
 
@@ -569,7 +577,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   Future<void> _clearAttachedImage({bool deleteFile = true}) async {
     final path = _attachedImagePath;
     final prefs = await SharedPreferences.getInstance();
-    await prefs.remove(attachedImagePathKey);
+    await prefs.remove(_attachedImagePathKey);
 
     if (deleteFile && path != null) {
       try {
@@ -596,7 +604,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   Future<Uint8List?> _captureEsp32Image() async {
     final bytes = await _apiService.captureImage();
     if (bytes == null) {
-      await _speak('Could not reach the camera.');
+      debugPrint('ERROR: Failed to capture image from ESP32-CAM.');
       return null;
     }
 
@@ -630,18 +638,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     }
 
     return _captureEsp32Image();
-  }
-
-  Future<void> _clearConsumedPhoneAttachmentIfNeeded() async {
-    if (_registrationStep != RegistrationStep.idle) {
-      return;
-    }
-
-    if (_attachedImagePath == null) {
-      return;
-    }
-
-    await _clearAttachedImage();
   }
 
   Future<Uint8List?> _readAttachedImageBytes() async {
@@ -772,8 +768,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     }
 
     if (primaryBytes == null) {
-      _setStatus('Camera error', _AppState.idle);
-      await _speak('I could not capture the image for registration.');
+      _setIdleState();
       await _resumeWakeWordIfIdle();
       return;
     }
@@ -808,7 +803,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   Future<void> _onSpeechResult(String rawText) async {
     final text = rawText.toLowerCase().trim();
     if (text.isEmpty) {
-      _setStatus('Ready - tap the mic.', _AppState.idle);
+      _setIdleState();
       await _resumeWakeWordIfIdle();
       return;
     }
@@ -947,14 +942,14 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
     final bytes = await _getImageForRequest();
     if (bytes == null) {
-      _setStatus('Camera error', _AppState.idle);
+      _setIdleState();
       await _resumeWakeWordIfIdle();
       return;
     }
 
     final imagePath = await _saveBytesToFile(bytes);
     if (imagePath == null) {
-      _setStatus('File error', _AppState.idle);
+      _setIdleState();
       await _resumeWakeWordIfIdle();
       return;
     }
@@ -967,10 +962,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       if (mounted) {
         setState(() => _serverResponse = message);
       }
-      _setStatus('No face detected', _AppState.idle);
-      await _speak(message);
+      _setIdleState();
+      await _speakAndWait(message, resumeWakeWord: true);
       _cleanup([imagePath]);
-      await _resumeWakeWordIfIdle();
       return;
     }
 
@@ -988,18 +982,13 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       if (mounted) {
         setState(() => _serverResponse = message);
       }
-      _setStatus('Done', _AppState.idle);
-      await _speak(message);
+      _setIdleState();
+      await _speakAndWait(message, resumeWakeWord: true);
     } catch (error) {
-      if (mounted) {
-        setState(() => _serverResponse = 'Face recognition error.');
-      }
-      _setStatus('Error', _AppState.idle);
-      await _speak('An error occurred during face recognition.');
-      debugPrint('[RECOGNIZE] Error: $error');
+      debugPrint('ERROR: $error');
+      _setIdleState(clearResponse: true);
     } finally {
       _cleanup([imagePath, cropPath]);
-      await _clearConsumedPhoneAttachmentIfNeeded();
       await _resumeWakeWordIfIdle();
     }
   }
@@ -1066,7 +1055,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
     if (registrationImages.isEmpty) {
       _resetPendingRegistrationDraft();
-      _setStatus('Camera error', _AppState.idle);
+      _setIdleState();
       await _resumeWakeWordIfIdle();
       return;
     }
@@ -1111,15 +1100,12 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         description: description,
         imageFile: imageFile,
       );
-      if (!result.success) {
+        if (!result.success) {
         if (savedPhotos == 0) {
           message = result.message ?? 'Registration failed.';
-          if (mounted) {
-            setState(() => _serverResponse = message);
-          }
+          debugPrint('ERROR: $message');
           _resetPendingRegistrationDraft();
-          _setStatus('No face', _AppState.idle);
-          await _speak(message);
+          _setIdleState(clearResponse: true);
           await _resumeWakeWordIfIdle();
           return;
         }
@@ -1151,9 +1137,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         _resetPendingRegistrationDraft();
       });
     }
-    _setStatus('Registered: $name', _AppState.idle);
-    await _speak(message);
-    await _resumeWakeWordIfIdle();
+    _setIdleState();
+    await _speakAndWait(message, resumeWakeWord: true);
   }
 
   Future<void> _handleVisionQuery(String query) async {
@@ -1170,21 +1155,25 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
     final bytes = await _getImageForRequest();
     if (bytes == null) {
-      _setStatus('Camera error', _AppState.idle);
+      _setIdleState();
       await _resumeWakeWordIfIdle();
       return;
     }
 
-    _setStatus('Asking NVIDIA Phi Vision...', _AppState.processing);
+    _setStatus('Analyzing image...', _AppState.processing);
     final response = await _apiService.analyzeImage(bytes, query);
+
+    if (response.trim().isEmpty) {
+      _setIdleState(clearResponse: true);
+      await _resumeWakeWordIfIdle();
+      return;
+    }
 
     if (mounted) {
       setState(() => _serverResponse = response);
     }
-    _setStatus('Done', _AppState.idle);
-    await _speak(response);
-    await _clearConsumedPhoneAttachmentIfNeeded();
-    await _resumeWakeWordIfIdle();
+    _setIdleState();
+    await _speakAndWait(response, resumeWakeWord: true);
   }
 
   Future<void> _cancelListening() async {
@@ -1194,9 +1183,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         _resetPendingRegistrationDraft();
       });
     }
-    _setStatus('Cancelled', _AppState.idle);
-    await _speak('Stopped.');
-    await _resumeWakeWordIfIdle();
+    _setIdleState();
+    await _speakAndWait('Stopped.', resumeWakeWord: true);
   }
 
   Future<void> _openFaceVault() async {
@@ -1246,29 +1234,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                 Icon(Icons.cloud_done, color: Colors.green, size: 16),
                 SizedBox(width: 6),
                 Text(
-                  'NVIDIA Phi-3.5 Vision',
+                  'Vision Assistant',
                   style: TextStyle(color: Colors.grey, fontSize: 13),
-                ),
-              ],
-            ),
-            const SizedBox(height: 8),
-            Row(
-              children: [
-                Icon(
-                  _wakeWordReady && _wakeWordRunning
-                      ? Icons.hearing
-                      : Icons.hearing_disabled,
-                  color: _wakeWordReady && _wakeWordRunning
-                      ? Colors.greenAccent
-                      : Colors.orangeAccent,
-                  size: 16,
-                ),
-                const SizedBox(width: 6),
-                Expanded(
-                  child: Text(
-                    _wakeWordMessage,
-                    style: const TextStyle(color: Colors.grey, fontSize: 13),
-                  ),
                 ),
               ],
             ),
